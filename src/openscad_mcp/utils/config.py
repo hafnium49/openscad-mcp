@@ -269,6 +269,13 @@ class Config(BaseModel):
             security_config["rate_limit"] = int(rate_limit)
         if max_file_size := os.getenv("MCP_MAX_FILE_SIZE_MB"):
             security_config["max_file_size_mb"] = int(max_file_size)
+        # Cowork Patch P1 (2026-04-27): wire MCP_ALLOWED_PATHS through from_env
+        # so the Windows installer can sandbox import()/include via env var.
+        # Accepts os.pathsep-separated list (";" on Windows, ":" on POSIX).
+        if allowed_paths := os.getenv("MCP_ALLOWED_PATHS"):
+            paths = [p for p in allowed_paths.split(os.pathsep) if p.strip()]
+            if paths:
+                security_config["allowed_paths"] = paths
         if security_config:
             config_dict["security"] = SecurityConfig(**security_config)
 
