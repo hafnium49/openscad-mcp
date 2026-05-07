@@ -38,6 +38,77 @@ mcp = FastMCP("OpenSCAD MCP Server")
 
 
 # ============================================================================
+# Variable Name Validation (Patch 2026-05-07 — accept OpenSCAD special vars)
+# ============================================================================
+
+# Accepts standard identifiers (foo, _bar, x1) and OpenSCAD special variables
+# ($fn, $fa, $fs, $t, $vpr, $vpt, $vpd, $preview, $_, $_x, etc.). Rejects
+# multi-dollar prefixes ($$fn), mid-name dollars (f$n), hyphens, spaces,
+# leading digits, empty strings, and Unicode identifiers.
+_VAR_NAME_RE = re.compile(r'^\$?[a-zA-Z_][a-zA-Z0-9_]*$')
+
+# OpenSCAD reserved words. Passing -D for any of these confuses the parser
+# or silently shadows the keyword. See https://openscad.org/cheatsheet/.
+_OPENSCAD_RESERVED: frozenset = frozenset({
+    "module", "function", "if", "else", "for", "intersection_for",
+    "let", "each", "true", "false", "undef", "include", "use",
+})
+
+# Per-special-variable upper-bound caps. Mitigates DoS via {"$fn": 999999}:
+# without these, widening the regex to accept $-prefixed names would let a
+# single caller spin OpenSCAD for the full MCP_RENDER_TIMEOUT (default 120s)
+# on a 5-slot semaphore. MCP_RATE_LIMIT is declared in config but not yet
+# enforced in the request path.
+_OPENSCAD_SPECIAL_BOUNDS: Dict[str, Tuple[float, float]] = {
+    "$fn": (0, 256),       # 256 sides is past the visible-quality plateau
+    "$fa": (0.01, 360),    # min angle in degrees
+    "$fs": (0.001, 1000),  # min size in mm
+    "$t":  (0.0, 1.0),     # animation time
+}
+
+
+def _validate_variable_names(variables: Optional[Dict[str, Any]]) -> None:
+    """Validate OpenSCAD variable names and values.
+
+    Accepts standard identifiers and OpenSCAD special variables ($fn, $fa,
+    $fs, $t, etc.). Rejects multi-dollar prefixes, embedded dollars,
+    hyphens, spaces, leading digits, empty strings, Unicode names, and
+    OpenSCAD reserved words. Bounds numeric values for known special
+    variables to prevent DoS via massive geometry counts.
+
+    Raises:
+        ValueError: with a message identifying the offending key/value.
+    """
+    if not variables:
+        return
+    for key, val in variables.items():
+        if not _VAR_NAME_RE.match(key):
+            raise ValueError(
+                f"Invalid variable name '{key}': "
+                f"must match {_VAR_NAME_RE.pattern}"
+            )
+        if key in _OPENSCAD_RESERVED:
+            raise ValueError(
+                f"Variable name '{key}' collides with an OpenSCAD reserved "
+                f"word; choose a different name"
+            )
+        if key in _OPENSCAD_SPECIAL_BOUNDS:
+            lo, hi = _OPENSCAD_SPECIAL_BOUNDS[key]
+            # bool is a subclass of int — reject explicitly so {"$fn": True}
+            # doesn't sneak through as 1.
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                raise ValueError(
+                    f"Variable '{key}' must be numeric; "
+                    f"got {type(val).__name__}"
+                )
+            if not (lo <= val <= hi):
+                raise ValueError(
+                    f"Variable '{key}'={val} out of allowed range "
+                    f"[{lo}, {hi}]"
+                )
+
+
+# ============================================================================
 # Helper Functions
 # ============================================================================
 
@@ -293,12 +364,7 @@ def render_scad_to_png(
                 f"({config.security.max_file_size_mb} MB / {max_bytes} bytes)"
             )
 
-    if variables:
-        for key in variables:
-            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', key):
-                raise ValueError(
-                    f"Invalid variable name '{key}': must match ^[a-zA-Z_][a-zA-Z0-9_]*$"
-                )
+    _validate_variable_names(variables)
 
     # Security: validate include_paths against allowed_paths
     if include_paths and config.security.allowed_paths:
@@ -1362,14 +1428,8 @@ async def export_model(
                     f"({config.security.max_file_size_mb} MB / {max_bytes} bytes)"
                 )
 
-        # Security: validate variable names
-        if variables:
-            for key in variables:
-                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', key):
-                    raise ValueError(
-                        f"Invalid variable name '{key}': "
-                        f"must match ^[a-zA-Z_][a-zA-Z0-9_]*$"
-                    )
+        # Security: validate variable names + values
+        _validate_variable_names(variables)
 
         openscad_cmd = find_openscad()
         if not openscad_cmd:
@@ -1998,16 +2058,8 @@ async def validate_scad(
                     f"{max_bytes} bytes)"
                 )
 
-        # Security: validate variable names
-        if variables:
-            for key in variables:
-                if not re.match(
-                    r'^[a-zA-Z_][a-zA-Z0-9_]*$', key
-                ):
-                    raise ValueError(
-                        f"Invalid variable name '{key}': "
-                        f"must match ^[a-zA-Z_][a-zA-Z0-9_]*$"
-                    )
+        # Security: validate variable names + values
+        _validate_variable_names(variables)
 
         openscad_cmd = find_openscad()
         if not openscad_cmd:
@@ -2036,15 +2088,32 @@ async def validate_scad(
                     f"SCAD file not found: {scad_file}"
                 )
 
-        # Build command: output to /dev/null (NUL on Windows)
-        null_output = (
-            "NUL" if platform.system() == "Windows"
-            else "/dev/null"
+        # Build command. We CANNOT use "-o /dev/null" because OpenSCAD
+        # 2021.01 (and likely earlier) rejects it before the parser
+        # runs: "Either add a valid suffix or specify one using the
+        # --export-format option." stderr is then empty, returncode is
+        # non-zero, and `is_valid = (returncode == 0 and ...)` is
+        # permanently False — which was bug B1 (2026-05-07 smoke test).
+        #
+        # Use a real .png discard target instead. OpenSCAD still emits
+        # ECHO/WARNING/ERROR to stderr while parsing, which is what
+        # `_parse_openscad_stderr` consumes. The PNG itself is unlinked
+        # in the `finally` clause below (covers the timeout path too).
+        #
+        # Discard PNG goes under config.cache.directory (NOT
+        # config.temp_dir) so MCP_CACHE_SIZE_MB's
+        # `_evict_cache_if_needed` covers it — `temp_dir` has no cap
+        # today (Security review F4, 2026-05-07).
+        cache_dir = Path(config.cache.directory)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        discard_output = (
+            cache_dir
+            / f"validate_discard_{uuid.uuid4().hex[:16]}.png"
         )
         cmd = [
             openscad_cmd,
             "--hardwarnings",
-            "-o", null_output,
+            "-o", str(discard_output),
         ]
 
         # Add variables
@@ -2085,37 +2154,44 @@ async def validate_scad(
                     f"{config.rendering.timeout_seconds} seconds"
                 )
 
-        result = await asyncio.get_running_loop().run_in_executor(
-            None, _run_validate
-        )
-
-        # Clean up temp input file
-        if cleanup_temp and scad_input_path.exists():
-            scad_input_path.unlink()
-
-        # Parse stderr for messages
-        parsed = _parse_openscad_stderr(result.stderr)
-
-        is_valid = (
-            result.returncode == 0 and len(parsed["errors"]) == 0
-        )
-
-        if ctx:
-            status = "valid" if is_valid else "invalid"
-            await ctx.info(
-                f"Validation complete: {status} "
-                f"({len(parsed['errors'])} error(s), "
-                f"{len(parsed['warnings'])} warning(s))"
+        # Cleanup must run on every exit path — success, parse error,
+        # timeout, anything else. The earlier shape (cleanup AFTER the
+        # return statement on the happy path only) leaked the discard
+        # PNG and the temp input on every TimeoutExpired re-raise.
+        # Mirrors `analyze_model` further down in this file.
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                None, _run_validate
             )
 
-        return {
-            "success": True,
-            "valid": is_valid,
-            "errors": parsed["errors"],
-            "warnings": parsed["warnings"],
-            "echo_output": parsed["echo_output"],
-            "deprecated": parsed["deprecated"],
-        }
+            # Parse stderr for messages
+            parsed = _parse_openscad_stderr(result.stderr)
+
+            is_valid = (
+                result.returncode == 0 and len(parsed["errors"]) == 0
+            )
+
+            if ctx:
+                status = "valid" if is_valid else "invalid"
+                await ctx.info(
+                    f"Validation complete: {status} "
+                    f"({len(parsed['errors'])} error(s), "
+                    f"{len(parsed['warnings'])} warning(s))"
+                )
+
+            return {
+                "success": True,
+                "valid": is_valid,
+                "errors": parsed["errors"],
+                "warnings": parsed["warnings"],
+                "echo_output": parsed["echo_output"],
+                "deprecated": parsed["deprecated"],
+            }
+        finally:
+            if cleanup_temp and scad_input_path.exists():
+                scad_input_path.unlink()
+            if discard_output.exists():
+                discard_output.unlink()
 
     except Exception as e:
         if ctx:
@@ -2195,16 +2271,8 @@ async def analyze_model(
                     f"{max_bytes} bytes)"
                 )
 
-        # Security: validate variable names
-        if variables:
-            for key in variables:
-                if not re.match(
-                    r'^[a-zA-Z_][a-zA-Z0-9_]*$', key
-                ):
-                    raise ValueError(
-                        f"Invalid variable name '{key}': "
-                        f"must match ^[a-zA-Z_][a-zA-Z0-9_]*$"
-                    )
+        # Security: validate variable names + values
+        _validate_variable_names(variables)
 
         openscad_cmd = find_openscad()
         if not openscad_cmd:
