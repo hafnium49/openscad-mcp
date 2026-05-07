@@ -430,8 +430,15 @@ class TestValidateScad:
         assert result["success"] is False
         assert "allowed paths" in result["error"].lower() or "not within" in result["error"].lower()
 
-    async def test_dev_null_output(self, configured_env, mock_subprocess_success):
-        """The validate command should use /dev/null (or NUL on Windows) as output."""
+    async def test_discard_output_is_real_png_under_cache_dir(
+        self, configured_env, mock_subprocess_success
+    ):
+        """The validate command must NOT use ``-o /dev/null`` — OpenSCAD
+        2021.01 rejects ``/dev/null`` before parsing because the suffix
+        doesn't determine an export format (this was bug B1, fixed
+        2026-05-07). Output target is now a real ``.png`` discard file
+        under ``config.cache.directory`` so ``MCP_CACHE_SIZE_MB`` covers
+        it."""
         captured_cmds = []
 
         def capturing_mock(cmd, **kwargs):
@@ -453,7 +460,15 @@ class TestValidateScad:
         assert "-o" in cmd
         o_idx = cmd.index("-o")
         output_target = cmd[o_idx + 1]
-        assert output_target in ("/dev/null", "NUL")
+        # Pin against any future regression to /dev/null or NUL.
+        assert output_target not in ("/dev/null", "NUL"), (
+            f"validate_scad must NOT use {output_target!r} as -o target; "
+            f"OpenSCAD 2021.01 rejects /dev/null before parsing (bug B1)"
+        )
+        # Discard file must end with .png and carry the validate_discard_
+        # prefix (so it's auditable in the cache dir).
+        assert output_target.endswith(".png"), output_target
+        assert "validate_discard_" in output_target, output_target
 
     async def test_hardwarnings_flag(self, configured_env, mock_subprocess_success):
         """The validate command should include --hardwarnings flag."""
