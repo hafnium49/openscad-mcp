@@ -10,9 +10,11 @@ Mirrors the plan's smoke-test idiom (MKC_Holmes_OpenSCAD_MCP_Cowork_Distribution
 Stage 3, lines 91-104) but uses the Streamable SSE Client against the live :9300/sse
 endpoint instead of an in-memory Client(mcp). Exercises all 15 tools end-to-end.
 
-After the B1/B2/B3 fixes deploy, the in-line ``# Workaround:`` comments below
-should be removed and the assertions tightened — see
-docs/openscad_mcp_bug_report.md §6-§7 for the acceptance gate.
+B1/B2/B3 fixes shipped 2026-05-07 (commits 16ee526, 1bc2818, cc9d0e8 on
+``feat/cowork-stdio``). The harness now runs without workarounds and asserts
+the post-fix correct verdicts inline; see CHANGELOG.md "Unreleased" entry
+for the per-bug attribution and ``docs/openscad_mcp_bug_report.md`` §6-§7
+for the original acceptance criteria.
 
 Run:
     uv run --with fastmcp python smoke-test-sse.py [endpoint]
