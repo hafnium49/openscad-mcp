@@ -1,34 +1,43 @@
 """
 Regression tests for ``render_perspectives``'s ``views`` parameter
-handling (B3 from ``docs/openscad_mcp_bug_report.md``, 2026-05-07).
+handling (B3 from ``docs/openscad_mcp_bug_report.md``).
 
-Bug B3 was reported as: passing ``views=["front","top","isometric"]`` over
-SSE+``mcp-remote`` (Claude Desktop on Windows) failed with::
+Bug B3 was reported as: passing ``views=["front","top","isometric"]``
+through Claude Desktop's ``tools/call`` surface failed with::
 
     1 validation error for call[render_perspectives]
     views
       Input should be a valid list [type=list_type,
         input_value='["front","top","isometric"]', input_type=str]
 
-Stage-2 diagnosis (2026-05-07) recorded in CHANGELOG:
-- **In-memory** ``Client(mcp).call_tool("render_perspectives", {"views":[...]})``
-  → PASS (3 views rendered).
-- **SSE** ``Client("http://127.0.0.1:9300/sse").call_tool(...)``
-  → PASS (3 views rendered).
+The earlier diagnosis (recorded in commit ``cc9d0e8``) attributed B3
+to mcp-remote. **That attribution was wrong.** Investigation 2026-05-07
+read mcp-remote v0.1.38 end-to-end and confirmed:
 
-So the bug is **specifically in the** ``mcp-remote`` **stdio→SSE shim**
-that Claude Desktop on Windows uses, NOT in openscad-mcp's tool layer
-and NOT in FastMCP's SSE deserialization. No code change in this repo;
-these tests codify the working baseline so any future regression in the
-openscad-mcp/FastMCP path is caught immediately.
+- ``CallToolRequestParamsSchema`` declares ``arguments: record(string,
+  unknown)`` — zod's ``unknown()`` neither validates nor transforms.
+- ``mcpProxy`` forwarder passes ``request.params`` through verbatim
+  (``return request``) without touching ``arguments``.
+- Wire serialization is whole-message ``JSON.stringify(message)`` at
+  three sites; nested arrays survive intact.
 
-Acceptance criteria covered (per bug report §7):
-- Item 9: diagnosis recorded in CHANGELOG (this docstring serves as the
-  in-test record; full prose in CHANGELOG.md).
-- Item 10: not applicable — fix landed elsewhere (mcp-remote).
-- Item 11: an ``xfail`` test would only make sense in a Claude-Desktop
-  test rig; we don't have one. Documenting via CHANGELOG attribution
-  instead.
+The shape originates **upstream** of mcp-remote — in a client-side
+tool-call argument encoder (Claude Desktop on Windows is the observed
+reproduction path; the encoder itself has not been directly inspected).
+
+Fix (this commit): server-side defensive coercion via
+``coerce_jsonish_list`` applied to ``render_perspectives.views`` via
+Pydantic ``Annotated[..., BeforeValidator(...)]``. Native lists pass
+through unchanged; JSON-stringified strings get re-parsed before the
+list-type validator runs.
+
+Tests below pin three paths:
+- in-memory ``Client(mcp)`` with native list (always worked, codified).
+- in-memory ``Client(mcp)`` with JSON-stringified string (post-fix only).
+- live SSE with both shapes.
+
+DoS hardening for the post-fix coercion path is in
+``tests/unit/test_render_perspectives_views_cap.py``.
 """
 from __future__ import annotations
 
@@ -109,6 +118,33 @@ class TestRenderPerspectivesInMemory:
             views = d.get("views", {})
             assert sorted(views) == ["front", "isometric", "top"], sorted(views)
 
+    async def test_explicit_views_jsonish_string_in_memory(self):
+        """**Post-fix only.** Passing ``views`` as a JSON-stringified
+        string — the exact shape Claude Desktop's encoder produces —
+        must be coerced back to a list by ``coerce_jsonish_list`` and
+        render normally. Pre-fix this errored with the Pydantic
+        ``list_type`` complaint (input_value='[\"front\",\"top\",\"isometric\"]',
+        input_type=str)."""
+        from fastmcp import Client
+        from openscad_mcp.server import mcp
+
+        async with Client(mcp) as c:
+            result = await c.call_tool(
+                "render_perspectives",
+                {
+                    "scad_content": "$fn=16; cube([5,5,5]);",
+                    # CRUCIAL: a string, not a list. The BeforeValidator
+                    # at server.py runs coerce_jsonish_list on this and
+                    # parses it back to ["front","top","isometric"].
+                    "views": '["front","top","isometric"]',
+                    "output_format": "base64",
+                },
+            )
+            d = result.data if hasattr(result, "data") else result
+            assert d.get("success") is True, d
+            views = d.get("views", {})
+            assert sorted(views) == ["front", "isometric", "top"], sorted(views)
+
 
 # =============================================================================
 # SSE probe — proves FastMCP's SSE deserialization accepts native lists
@@ -141,10 +177,10 @@ class TestRenderPerspectivesOverSSE:
         except (ConnectionRefusedError, OSError):
             pytest.skip("openscad-mcp SSE daemon not running on :9300")
 
-    async def test_explicit_views_over_sse(self, sse_daemon_or_skip):
+    async def test_explicit_views_native_list_over_sse(self, sse_daemon_or_skip):
         """Native list arg over SSE → 3 views back. Proves FastMCP's
-        SSE wire path is NOT the bug-B3 culprit; ``mcp-remote`` is the
-        surviving suspect for Claude-Desktop reproductions."""
+        SSE wire path accepts native lists end-to-end (always worked,
+        codified as a regression guard)."""
         from fastmcp import Client
 
         async with Client("http://127.0.0.1:9300/sse") as c:
@@ -153,6 +189,28 @@ class TestRenderPerspectivesOverSSE:
                 {
                     "scad_content": "$fn=16; cube([5,5,5]);",
                     "views": ["front", "top", "isometric"],
+                    "output_format": "base64",
+                },
+            )
+            d = result.data if hasattr(result, "data") else result
+            assert d.get("success") is True, d
+            views = d.get("views", {})
+            assert sorted(views) == ["front", "isometric", "top"], sorted(views)
+
+    async def test_explicit_views_jsonish_string_over_sse(self, sse_daemon_or_skip):
+        """**Post-fix only.** A JSON-stringified ``views`` over SSE —
+        the exact shape Claude Desktop's encoder produces — must be
+        coerced back to a list by the BeforeValidator and render
+        normally. Pre-fix this errored at the Pydantic list-type
+        check on the daemon side."""
+        from fastmcp import Client
+
+        async with Client("http://127.0.0.1:9300/sse") as c:
+            result = await c.call_tool(
+                "render_perspectives",
+                {
+                    "scad_content": "$fn=16; cube([5,5,5]);",
+                    "views": '["front","top","isometric"]',
                     "output_format": "base64",
                 },
             )

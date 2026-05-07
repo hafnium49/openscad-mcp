@@ -15,9 +15,10 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, Tuple
+from typing import Annotated, Any, Dict, List, Optional, Union, Tuple
 
 from fastmcp import Context, FastMCP
+from pydantic import BeforeValidator
 from PIL import Image
 import json
 
@@ -30,6 +31,7 @@ from .types import (
     ServerInfo,
     Vector3D,
 )
+from .utils.argcoerce import coerce_jsonish_list
 from .utils.config import get_config
 
 
@@ -65,6 +67,13 @@ _OPENSCAD_SPECIAL_BOUNDS: Dict[str, Tuple[float, float]] = {
     "$fs": (0.001, 1000),  # min size in mm
     "$t":  (0.0, 1.0),     # animation time
 }
+
+# Per-call cap on render_perspectives view count. Mitigates DoS via
+# JSON-stringified payloads like '["front",' * 5000 + '"top"]' that
+# would parse to 5,001 view names, all whitelisted, and queue 5,001
+# OpenSCAD subprocesses via asyncio.gather (Security review Q4
+# 2026-05-07). 32 is generous — the canonical preset list is 7.
+_MAX_VIEWS_PER_CALL = 32
 
 
 def _validate_variable_names(variables: Optional[Dict[str, Any]]) -> None:
@@ -1113,7 +1122,10 @@ async def render_single(
 async def render_perspectives(
     scad_content: Optional[str] = None,
     scad_file: Optional[str] = None,
-    views: Optional[List[str]] = None,
+    views: Annotated[
+        Optional[List[str]],
+        BeforeValidator(coerce_jsonish_list),
+    ] = None,
     image_size: Optional[str] = None,
     color_scheme: Optional[str] = None,
     variables: Optional[Dict[str, Any]] = None,
@@ -1166,6 +1178,19 @@ async def render_perspectives(
         else:
             # Parse views if provided as string
             views = parse_list_param(views, default_views)
+
+        # Dedupe (preserving caller order) + cap. Mitigates DoS via large
+        # coerced payloads like '["front",' * 5000 + '"top"]' that would
+        # parse to 5,001 entries and queue 5,001 OpenSCAD subprocesses
+        # via asyncio.gather (Security review Q4 2026-05-07). The cap
+        # fires before the whitelist check below so even a payload of
+        # 5,000 valid-name strings is rejected at the boundary.
+        views = list(dict.fromkeys(views))
+        if len(views) > _MAX_VIEWS_PER_CALL:
+            raise ValueError(
+                f"Too many views requested: {len(views)} > "
+                f"{_MAX_VIEWS_PER_CALL} (per-call cap)"
+            )
 
         # Validate view names
         invalid_views = [v for v in views if v not in VIEW_PRESETS]

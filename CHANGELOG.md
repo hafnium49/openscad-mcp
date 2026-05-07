@@ -17,10 +17,18 @@ consumer repo at ``docs/openscad_mcp_bug_report.md``.
   not pytest-discovered (no ``test_`` prefix).
 - ``tests/integration/`` package: ``test_validate_scad.py`` (B1),
   ``test_render_quality_presets.py`` (B2), and
-  ``test_render_perspectives_views.py`` (B3 baseline).
-- ``tests/unit/test_variable_validation.py`` — 34 tests for the new
+  ``test_render_perspectives_views.py`` (B3 — extended in this round
+  with two ``jsonish_string`` tests covering the BeforeValidator path).
+- ``tests/unit/test_variable_validation.py`` — 34 tests for the
   ``_validate_variable_names`` helper (positive cases, regression
   pins, OpenSCAD reserved-word rejection, value-bound DoS guards).
+- ``src/openscad_mcp/utils/argcoerce.py`` — ``coerce_jsonish_list``
+  helper for B3's defensive coercion (see Fixed section).
+- ``tests/unit/test_argcoerce.py`` — 13 tests for the helper, including
+  a mocked ``RecursionError`` pin.
+- ``tests/unit/test_render_perspectives_views_cap.py`` — 4 tests
+  pinning the per-call ``_MAX_VIEWS_PER_CALL = 32`` cap + dedupe
+  semantics.
 
 ### Fixed
 - **B1 — ``validate_scad`` always returned ``valid:false``.** The tool
@@ -72,21 +80,51 @@ consumer repo at ``docs/openscad_mcp_bug_report.md``.
   by regression tests so a future "make it more permissive" refactor
   can't open these vectors silently.
 
-### Diagnostic note (B3 — not fixed in this repo)
-- B3 (``views=[...]`` over SSE arrives as a JSON-stringified string)
-  was diagnosed via two probes on 2026-05-07:
-  - In-memory ``Client(mcp).call_tool("render_perspectives",
-    {"views": [...]})`` → **PASS** (3 views rendered).
-  - SSE ``Client("http://127.0.0.1:9300/sse").call_tool(...)`` →
-    **PASS** (3 views rendered).
-- Both ``fastmcp.Client`` paths handle native lists correctly. The
-  bug-report's reproduction came through Claude Desktop's
-  ``mcp-remote`` shim on Windows, which is the surviving suspect.
-  No openscad-mcp source change required; instead
-  ``tests/integration/test_render_perspectives_views.py`` codifies
-  the working baseline so any future regression in the openscad-mcp
-  or FastMCP wire path is caught immediately. Filing the upstream
-  ``mcp-remote`` issue is operator follow-up.
+### Fixed (B3 — corrects prior mcp-remote attribution)
+- **B3 — list params delivered as JSON-stringified strings.** A
+  client-side tool-call argument encoder ``JSON.stringify``s
+  array-typed values before handing them to the JSON-RPC layer, so
+  ``views=["front","top","isometric"]`` arrives at the FastMCP
+  validator as the literal string
+  ``'["front","top","isometric"]'`` and fails the
+  ``Optional[List[str]]`` type check. Reproduction path is Claude
+  Desktop on Windows; the encoder itself has not been directly
+  inspected (closed-source).
+
+  **The earlier version of this entry attributed the bug to
+  mcp-remote. That attribution was wrong.** Investigation 2026-05-07
+  read mcp-remote v0.1.38 end-to-end:
+  ``CallToolRequestParamsSchema`` declares ``arguments: record(string,
+  unknown)`` (zod's ``unknown()`` neither validates nor transforms);
+  ``mcpProxy`` is a pure pass-through (``return request`` after an
+  ignore-list filter on ``request.params.name``); wire serialization
+  is whole-message ``JSON.stringify(message)``, which preserves
+  nested arrays. mcp-remote cannot have introduced the
+  stringification. Origin is upstream of mcp-remote.
+
+  Fix: ``coerce_jsonish_list`` helper in
+  ``src/openscad_mcp/utils/argcoerce.py``, applied via Pydantic
+  ``Annotated[Optional[List[str]], BeforeValidator(coerce_jsonish_list)]``
+  to ``render_perspectives.views``. Re-parses string-shaped lists at
+  the tool boundary; never raises (catches ``json.JSONDecodeError``,
+  ``ValueError``, AND ``RecursionError`` — the last covers
+  pathologically nested payloads under the 64 KB cap that would
+  otherwise stack-exhaust the worker thread). Native lists and
+  ``None`` pass through unchanged.
+
+### Security (B3 follow-on hardening)
+- ``render_perspectives`` enforces ``_MAX_VIEWS_PER_CALL = 32``
+  after helper coercion and dedupes via ``dict.fromkeys`` to
+  mitigate DoS via large coerced payloads. A 50 KB
+  ``'["front",' * 5000 + '"top"]'`` string would otherwise parse
+  to 5,001 entries, all whitelisted, and queue 5,001 OpenSCAD
+  subprocesses via ``asyncio.gather``. Closes Security review item
+  Q4 from the multi-agent review.
+- Helper catches ``RecursionError`` from ``json.loads`` in addition
+  to ``JSONDecodeError`` / ``ValueError``. Closes Security review
+  item Q1. Latent ``RecursionError`` exposure in ``parse_list_param``
+  at ``server.py:573`` (pre-dates this fix, different reproduction
+  path) is noted as a known follow-up.
 
 ## [0.1.0] - 2024-01-26
 
