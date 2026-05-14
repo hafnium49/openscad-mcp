@@ -60,7 +60,11 @@ export MCP_LOG_LEVEL=INFO
 # (security review #4): a SCAD `include </tmp/openscad_mcp.log>` would
 # otherwise pass the prefix-based sandbox check and leak prior-render
 # stderr fragments through OpenSCAD's parse-error message.
-export MCP_LOG_FILE=/tmp/openscad_mcp.log
+# Persistent log path (2026-05-14): moved off /tmp (tmpfs, cleared on
+# reboot) so post-reboot forensics survive when journalctl --user is
+# wiped from /run.
+mkdir -p /home/hafnium/mcp-logs
+export MCP_LOG_FILE=/home/hafnium/mcp-logs/openscad-mcp.log
 export PYTHONUNBUFFERED=1
 
 # Transport / host / port consumed by openscad_mcp.server.main() at startup.
@@ -94,5 +98,7 @@ echo "LOG_FILE=$LOG_FILE"
 # (e.g. pkill -f) reaches the Python process directly. stdout/stderr
 # append into the same log file. Transport/host/port are read from the
 # env vars exported above.
+# Absolute uv path (2026-05-14): eliminates PATH dependency when invoked
+# from systemd (--user unit doesn't inherit ~/.local/bin via default PATH).
 exec >>"$LOG_FILE" 2>&1
-uv run openscad-mcp
+/home/hafnium/.local/bin/uv run openscad-mcp
