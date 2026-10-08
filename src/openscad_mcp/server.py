@@ -9,6 +9,7 @@ import logging
 import os
 import platform
 import re
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -33,6 +34,36 @@ from .types import (
 )
 from .utils.argcoerce import coerce_jsonish_list
 from .utils.config import get_config
+from .scad_guard import (
+    ScadRefused,
+    assert_no_external_reference,
+    child_environment,
+)
+
+
+def _guarded_source_text(
+    scad_content: Optional[str],
+    scad_file: Optional[str],
+) -> str:
+    """Return the OpenSCAD source to render, after refusing external-file references.
+
+    MH-254: the model always sends inline ``scad_content`` and that text was never
+    inspected, so an inline ``include <...>`` / ``use <...>`` / ``import("...")`` /
+    ``surface(file="...")`` could read any absolute host path the daemon user can
+    read and return OpenSCAD's stderr to the caller. The same lexer rule is applied
+    to inline content AND to the contents of a ``scad_file``. Raises ``ScadRefused``.
+    """
+    if scad_content is not None:
+        text = scad_content
+    elif scad_file is not None:
+        try:
+            text = Path(scad_file).read_text()
+        except OSError as exc:
+            raise FileNotFoundError(f"SCAD file not found: {scad_file}") from exc
+    else:
+        raise ValueError("Either scad_content or scad_file must be provided")
+    assert_no_external_reference(text)
+    return text
 
 
 # Initialize the FastMCP server
@@ -375,6 +406,11 @@ def render_scad_to_png(
 
     _validate_variable_names(variables)
 
+    # MH-254: refuse external-file references in model-supplied source (inline or
+    # from scad_file). This is the primary control; the isolated empty working dir
+    # and minimal env below are defense-in-depth.
+    source_text = _guarded_source_text(scad_content, scad_file)
+
     # Security: validate include_paths against allowed_paths
     if include_paths and config.security.allowed_paths:
         for inc_path in include_paths:
@@ -414,16 +450,12 @@ def render_scad_to_png(
     with tempfile.TemporaryDirectory(dir=config.temp_dir) as temp_dir:
         temp_path = Path(temp_dir)
 
-        # Handle input source
-        if scad_content:
-            scad_path = temp_path / "input.scad"
-            scad_path.write_text(scad_content)
-        elif scad_file:
-            scad_path = Path(scad_file)
-            if not scad_path.exists():
-                raise FileNotFoundError(f"SCAD file not found: {scad_file}")
-        else:
-            raise ValueError("Either scad_content or scad_file must be provided")
+        # Handle input source. The guarded text is written into the per-render
+        # empty temp dir (MH-254), so OpenSCAD resolves the source file's directory
+        # to a directory containing only this file — a relative reference that
+        # slipped the lexer resolves to nothing.
+        scad_path = temp_path / "input.scad"
+        scad_path.write_text(source_text)
 
         # Output path
         output_path = temp_path / "output.png"
@@ -468,11 +500,14 @@ def render_scad_to_png(
         # Add the SCAD file
         cmd.append(str(scad_path))
 
-        # Run OpenSCAD
+        # Run OpenSCAD in the isolated working dir with a minimal allow-listed
+        # environment (MH-254), so no token/key/AWS_* value from the daemon's
+        # environment is visible to the program the model wrote.
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, check=False,
-                timeout=config.rendering.timeout_seconds
+                timeout=config.rendering.timeout_seconds,
+                cwd=temp_dir, env=child_environment(temp_path),
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError(
@@ -1475,17 +1510,12 @@ async def export_model(
             export_dir.mkdir(parents=True, exist_ok=True)
             final_output = export_dir / f"export_{uuid.uuid4().hex[:8]}.{fmt}"
 
-        # Handle input source
-        cleanup_temp = False
-        if scad_content:
-            tmp_input = temp_dir_path / f"input_{uuid.uuid4().hex[:8]}.scad"
-            tmp_input.write_text(scad_content)
-            scad_input_path = tmp_input
-            cleanup_temp = True
-        else:
-            scad_input_path = Path(scad_file)
-            if not scad_input_path.exists():
-                raise FileNotFoundError(f"SCAD file not found: {scad_file}")
+        # Handle input source. MH-254: refuse external-file references, then render
+        # the guarded source from an isolated empty working dir with a minimal env.
+        source_text = _guarded_source_text(scad_content, scad_file)
+        work_dir = Path(tempfile.mkdtemp(dir=temp_dir_path))
+        scad_input_path = work_dir / "input.scad"
+        scad_input_path.write_text(source_text)
 
         # Build command
         cmd = [openscad_cmd, "-o", str(final_output)]
@@ -1511,7 +1541,8 @@ async def export_model(
         if ctx:
             await ctx.info(f"Exporting to {fmt}...")
 
-        # Run OpenSCAD in executor
+        # Run OpenSCAD in executor, in the isolated working dir with a minimal
+        # allow-listed environment (MH-254).
         def _run_export():
             try:
                 result = subprocess.run(
@@ -1520,6 +1551,8 @@ async def export_model(
                     text=True,
                     check=False,
                     timeout=config.rendering.timeout_seconds,
+                    cwd=str(work_dir),
+                    env=child_environment(work_dir),
                 )
                 return result
             except subprocess.TimeoutExpired:
@@ -1528,13 +1561,13 @@ async def export_model(
                     f"{config.rendering.timeout_seconds} seconds"
                 )
 
-        result = await asyncio.get_running_loop().run_in_executor(
-            None, _run_export
-        )
-
-        # Clean up temp input file
-        if cleanup_temp and scad_input_path.exists():
-            scad_input_path.unlink()
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                None, _run_export
+            )
+        finally:
+            # Remove the isolated input dir on every exit path.
+            shutil.rmtree(work_dir, ignore_errors=True)
 
         if result.returncode != 0:
             raise RuntimeError(f"OpenSCAD export failed: {result.stderr}")
@@ -2096,22 +2129,12 @@ async def validate_scad(
         temp_dir_path = Path(config.temp_dir)
         temp_dir_path.mkdir(parents=True, exist_ok=True)
 
-        # Handle input source
-        cleanup_temp = False
-        if scad_content:
-            tmp_input = (
-                temp_dir_path
-                / f"validate_{uuid.uuid4().hex[:8]}.scad"
-            )
-            tmp_input.write_text(scad_content)
-            scad_input_path = tmp_input
-            cleanup_temp = True
-        else:
-            scad_input_path = Path(scad_file)
-            if not scad_input_path.exists():
-                raise FileNotFoundError(
-                    f"SCAD file not found: {scad_file}"
-                )
+        # Handle input source. MH-254: refuse external-file references, then
+        # validate the guarded source from an isolated empty working dir.
+        source_text = _guarded_source_text(scad_content, scad_file)
+        work_dir = Path(tempfile.mkdtemp(dir=temp_dir_path))
+        scad_input_path = work_dir / "input.scad"
+        scad_input_path.write_text(source_text)
 
         # Build command. We CANNOT use "-o /dev/null" because OpenSCAD
         # 2021.01 (and likely earlier) rejects it before the parser
@@ -2162,7 +2185,8 @@ async def validate_scad(
         if ctx:
             await ctx.info("Validating OpenSCAD code...")
 
-        # Run OpenSCAD in executor
+        # Run OpenSCAD in executor, in the isolated working dir with a minimal
+        # allow-listed environment (MH-254).
         def _run_validate():
             try:
                 result = subprocess.run(
@@ -2171,6 +2195,8 @@ async def validate_scad(
                     text=True,
                     check=False,
                     timeout=config.rendering.timeout_seconds,
+                    cwd=str(work_dir),
+                    env=child_environment(work_dir),
                 )
                 return result
             except subprocess.TimeoutExpired:
@@ -2213,8 +2239,7 @@ async def validate_scad(
                 "deprecated": parsed["deprecated"],
             }
         finally:
-            if cleanup_temp and scad_input_path.exists():
-                scad_input_path.unlink()
+            shutil.rmtree(work_dir, ignore_errors=True)
             if discard_output.exists():
                 discard_output.unlink()
 
@@ -2309,22 +2334,12 @@ async def analyze_model(
         temp_dir_path = Path(config.temp_dir)
         temp_dir_path.mkdir(parents=True, exist_ok=True)
 
-        # Handle input source
-        cleanup_input = False
-        if scad_content:
-            tmp_input = (
-                temp_dir_path
-                / f"analyze_{uuid.uuid4().hex[:8]}.scad"
-            )
-            tmp_input.write_text(scad_content)
-            scad_input_path = tmp_input
-            cleanup_input = True
-        else:
-            scad_input_path = Path(scad_file)
-            if not scad_input_path.exists():
-                raise FileNotFoundError(
-                    f"SCAD file not found: {scad_file}"
-                )
+        # Handle input source. MH-254: refuse external-file references, then
+        # analyze the guarded source from an isolated empty working dir.
+        source_text = _guarded_source_text(scad_content, scad_file)
+        work_dir = Path(tempfile.mkdtemp(dir=temp_dir_path))
+        scad_input_path = work_dir / "input.scad"
+        scad_input_path.write_text(source_text)
 
         # Create temp STL output path
         stl_output = (
@@ -2356,7 +2371,8 @@ async def analyze_model(
         if ctx:
             await ctx.info("Analyzing model geometry...")
 
-        # Run OpenSCAD export in executor
+        # Run OpenSCAD export in executor, in the isolated working dir with a
+        # minimal allow-listed environment (MH-254).
         def _run_export():
             try:
                 result = subprocess.run(
@@ -2365,6 +2381,8 @@ async def analyze_model(
                     text=True,
                     check=False,
                     timeout=config.rendering.timeout_seconds,
+                    cwd=str(work_dir),
+                    env=child_environment(work_dir),
                 )
                 return result
             except subprocess.TimeoutExpired:
@@ -2373,13 +2391,13 @@ async def analyze_model(
                     f"{config.rendering.timeout_seconds} seconds"
                 )
 
-        result = await asyncio.get_running_loop().run_in_executor(
-            None, _run_export
-        )
-
-        # Clean up temp input file
-        if cleanup_input and scad_input_path.exists():
-            scad_input_path.unlink()
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                None, _run_export
+            )
+        finally:
+            # Remove the isolated input dir on every exit path.
+            shutil.rmtree(work_dir, ignore_errors=True)
 
         if result.returncode != 0:
             # Clean up STL if it exists
