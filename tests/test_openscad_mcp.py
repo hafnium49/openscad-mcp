@@ -689,6 +689,14 @@ class TestRenderScadToPngCommand:
             lambda: "/usr/bin/openscad",
         )
 
+        # MH-256: these command-construction tests fake OpenSCAD via a global
+        # subprocess.run patch; stub the sandbox self-test to True so the wrapped
+        # command still reaches the mock (the confinement itself is covered by the
+        # dedicated sandbox tests with the real binary).
+        monkeypatch.setattr(
+            "openscad_mcp.sandbox.sandbox_available", lambda: True
+        )
+
         # Store tmp_path for individual tests
         self._tmp_path = tmp_path
 
