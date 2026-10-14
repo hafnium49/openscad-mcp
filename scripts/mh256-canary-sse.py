@@ -128,6 +128,17 @@ async def _run_canary(endpoint: str, token: str, stem: Path) -> int:
                             "output_format": "base64"}),
         ("render_single", {"scad_content": f'import_stl("{stem}.stl");',
                             "output_format": "base64"}),
+        # 2026-10-14 peer review: a LATER positional, a call and an index expression
+        # each bound `file` and READ a DXF past the first-token guard (6bb5299 refuses).
+        ("render_single", {"scad_content":
+                           f'linear_extrude(height=1, "{stem}.dxf") square(1);',
+                            "output_format": "base64"}),
+        ("render_single", {"scad_content":
+                           f'linear_extrude(str("{stem}", ".dxf"));',
+                            "output_format": "base64"}),
+        ("render_single", {"scad_content":
+                           f'f=["{stem}.dxf"]; linear_extrude(f[0]);',
+                            "output_format": "base64"}),
         ("export_model", {"scad_content": f'surface(file="{stem}.dat");',
                           "output_format": "stl"}),
         ("validate_scad", {"scad_content": f'import("{stem}.svg");'}),
