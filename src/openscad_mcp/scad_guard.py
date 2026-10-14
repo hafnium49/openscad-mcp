@@ -82,20 +82,27 @@ _FILE_KWARG = re.compile(
     r"(?<![A-Za-z0-9_$.])file" + _GAP + r"=(?!=)", re.IGNORECASE
 )
 
-#: ``linear_extrude``/``rotate_extrude`` whose FIRST positional argument is a string
-#: literal or a bare identifier — i.e. the deprecated ``linear_extrude("x.dxf")`` /
-#: ``linear_extrude(f)`` DXF-file form (``f`` holding a path is indistinguishable
-#: here from ``f`` holding a height, so a bare identifier is refused; write
-#: ``linear_extrude(height=h)`` or an arithmetic expression instead). A numeric or
-#: vector first positional (``linear_extrude(10)``, ``linear_extrude([...])``), a
-#: named argument (``height=``/``angle=``/``$fn=``) and an expression starting with a
-#: number are all admitted. Capture group 2 is the identifier (or empty for a
-#: string), group 3 the first char after it.
-_EXTRUDE_HEAD = re.compile(
-    r"(?<![A-Za-z0-9_$.])(linear_extrude|rotate_extrude)" + _GAP + r"\(" + _GAP
-    + r'(?:(")|([A-Za-z_$][A-Za-z0-9_$]*)' + _GAP + r"(.?))",
-    re.IGNORECASE,
+#: ``linear_extrude``/``rotate_extrude`` keep a deprecated ``file`` parameter, and
+#: OpenSCAD 2021.01 binds POSITIONAL arguments to it BY INDEX regardless of any named
+#: argument written before them, then reads the file for ANY string-valued expression.
+#: MH-256 first looked only at the first token after ``(``, and a peer review showed
+#: ``linear_extrude(height=1, "x.dxf")``, ``linear_extrude(str("x", ".dxf"))`` and
+#: ``f=["x.dxf"]; linear_extrude(f[0])`` all READ the file (measured on the host's
+#: 2021.01, 2026-10-14). Whether an expression is a string is a runtime fact, so the
+#: rule is positive and lexical, the same as v6 ``scad_compute.file_read_violations``:
+#: split the call at TOP-LEVEL commas (bracket-, string- and comment-aware) and admit
+#: each argument only if it is NAMED (``height=``, ``$fn=``), a bare number, or a
+#: signed number. Anything else positional is refused — ``linear_extrude(h*2)``
+#: included; the skill tells the model to write ``height=``.
+_EXTRUDE_CALLS = frozenset({"linear_extrude", "rotate_extrude"})
+_TOKEN = re.compile(
+    r"(?P<ws>\s+)|(?P<lc>//[^\n]*)|(?P<bc>/\*[\s\S]*?(?:\*/|\Z))"
+    r'|(?P<str>"(?:[^"\\]|\\[\s\S])*(?:"|\Z))'
+    r"|(?P<num>(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?(?![A-Za-z0-9_]))"
+    r"|(?P<id>\$?[A-Za-z0-9_]+)"
+    r"|(?P<op>==|!=|<=|>=|&&|\|\||[\s\S])"
 )
+
 
 #: The ONE library reference a caller may write, matched as a WHOLE LINE, mirroring
 #: v6's ``_MCAD_LINE``. ``bitmap/`` is the one sub-directory admitted (as on the host);
@@ -193,8 +200,8 @@ def _reason(code: str, detail: str) -> "ScadRefused":
 
 _EXTERNAL_REFERENCE_DETAIL = (
     "This daemon renders self-contained programs only: include/use/import/surface, "
-    "the dxf_* readers, a `file=` argument and a string/identifier passed as the "
-    "first argument of linear_extrude/rotate_extrude are refused as a FEATURE, "
+    "the dxf_* readers, a `file=` argument and any positional argument of "
+    "linear_extrude/rotate_extrude other than a plain number are refused as a FEATURE, "
     "because validating a model-chosen path is not a property anyone can check. "
     "Installed MCAD files may be referenced as a whole-line `include <MCAD/<file>.scad>`."
 )
@@ -209,8 +216,9 @@ def assert_no_external_reference(source: str) -> None:
     MH-256 widened the lexical scope to close the holes MH-254 left open: the lexer
     is now comment/whitespace-aware between a builtin name and its ``(``; it refuses
     ``import``/``import_stl``/``import_off``/``import_dxf``, ``surface``, every
-    ``dxf_*`` reader, any ``file =`` named argument, and a string-literal or bare-
-    identifier first positional of ``linear_extrude``/``rotate_extrude``.
+    ``dxf_*`` reader, any ``file =`` named argument, and (2026-10-14, after a peer
+    review) every positional argument of ``linear_extrude``/``rotate_extrude`` that is
+    not a plain number — the earlier first-token check admitted a later positional.
 
     ⚠️ This lexical refusal is DEFENSE IN DEPTH. The load-bearing control is the
     mount-namespace sandbox in :mod:`openscad_mcp.sandbox`, which makes every host
@@ -240,39 +248,64 @@ def assert_no_external_reference(source: str) -> None:
             "the source passes a `file=` argument. " + _EXTERNAL_REFERENCE_DETAIL,
         )
 
-    _assert_extrude_first_positional(scan)
+    _assert_extrude_positionals(scan)
 
 
-def _assert_extrude_first_positional(scan: str) -> None:
-    """Refuse a string-literal or bare-identifier first positional of
-    ``linear_extrude``/``rotate_extrude`` (the deprecated DXF-file form)."""
-    for m in _EXTRUDE_HEAD.finditer(scan):
-        fn = m.group(1).lower()
-        is_string = m.group(2) is not None
-        ident = m.group(3)
-        after = m.group(4) or ""
-        if is_string:
+def _tokens(text: str) -> list[tuple[str, str]]:
+    """``[(kind, text)]`` with whitespace and comments dropped. Kinds: str, num, id, op."""
+    out: list[tuple[str, str]] = []
+    for m in _TOKEN.finditer(text):
+        kind = m.lastgroup or "op"
+        if kind not in ("ws", "lc", "bc"):
+            out.append((kind, m.group()))
+    return out
+
+
+def _assert_extrude_positionals(scan: str) -> None:
+    """Refuse every positional argument of ``linear_extrude``/``rotate_extrude`` that is
+    not a (signed) number literal — any one of them can bind the deprecated ``file``
+    parameter (see ``_EXTRUDE_CALLS``). An index walk, never a slice per call (v6
+    measured the slice at O(calls x tokens): 6 s on a 1 MiB program)."""
+    toks = _tokens(scan)
+    for i, (kind, val) in enumerate(toks):
+        if kind != "id" or val.lower() not in _EXTRUDE_CALLS:
+            continue
+        if i + 1 >= len(toks) or toks[i + 1][1] != "(":
+            continue
+        depth = 0
+        args: list[list[tuple[str, str]]] = []
+        cur: list[tuple[str, str]] = []
+        for j in range(i + 2, len(toks)):
+            k2, v2 = toks[j]
+            if k2 == "op" and v2 in "([{":
+                depth += 1
+            elif k2 == "op" and v2 in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif k2 == "op" and v2 == "," and depth == 0:
+                args.append(cur)
+                cur = []
+                continue
+            cur.append((k2, v2))
+        args.append(cur)
+        for pos, arg in enumerate(args, start=1):
+            if not arg or (len(arg) >= 2 and arg[0][0] == "id" and arg[1][1] == "="):
+                continue  # empty, or NAMED (`==` is one token, so a comparison is not)
+            if len(arg) == 1 and arg[0][0] == "num":
+                continue  # a bare number
+            if len(arg) == 2 and arg[0][1] in ("-", "+") and arg[1][0] == "num":
+                continue  # a signed number
+            # The argument's POSITION, never its text: a refusal does not echo a
+            # model-chosen path (pinned by test_refusal_message_never_echoes_the_model_path).
+            fn = val.lower()
             raise _reason(
                 "external_reference_refused",
-                f"the source passes a string literal as the first argument of "
-                f"{fn!r} (the deprecated DXF-file form). "
+                f"{fn}() binds a positional argument to its deprecated `file` parameter, "
+                f"so argument {pos} (not a plain number) could name a file to read. Name it: "
+                f"{fn}(height=...) / {fn}(angle=...), or pass a plain number. "
                 + _EXTERNAL_REFERENCE_DETAIL,
             )
-        if ident is not None:
-            # A named argument (`height=`, `angle=`, `$fn=`) is fine; a `==` is a
-            # comparison, not an assignment. Anything else after a lone identifier
-            # (a `)` or `,`) is a bare variable positional — refuse it.
-            if after == "=":
-                continue  # named argument
-            if after in (")", ","):
-                raise _reason(
-                    "external_reference_refused",
-                    f"the source passes a bare identifier as the first argument of "
-                    f"{fn!r}; write `{fn}(height=<var>)` for a height or inline the "
-                    f"geometry. " + _EXTERNAL_REFERENCE_DETAIL,
-                )
-            # An operator (`*`, `+`, `.`, `[`) means an arithmetic/index expression
-            # that cannot be a filename — admit it.
 
 
 # ============================================================================

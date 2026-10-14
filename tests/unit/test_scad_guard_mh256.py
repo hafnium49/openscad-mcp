@@ -37,6 +37,19 @@ pytestmark = pytest.mark.unit
         'rotate_extrude("x.dxf");',
         'f="x.dxf"; linear_extrude(f);',          # bare variable positional
         'g = "x.dxf"; rotate_extrude( g );',      # with whitespace
+        # 2026-10-14 peer review: 2021.01 binds positionals to `file` BY INDEX, after any
+        # named argument, and reads for ANY string-valued expression. The first-token
+        # check admitted all of these; the first three were measured to READ a DXF.
+        'linear_extrude(height=1, "x.dxf");',     # a later positional
+        'linear_extrude(str("x", ".dxf"));',      # a call evaluating to a string
+        'f=["x.dxf"]; linear_extrude(f[0]);',     # an index expression
+        'f="x.dxf"; linear_extrude((f));',        # parenthesised
+        'f="x.dxf"; linear_extrude(1 ? f : 0);',  # a ternary starting with a number
+        'f="x.dxf"; rotate_extrude(angle=360, f);',
+        'f="x.dxf"; linear_extrude(/*c*/ f /*c*/);',  # comment-wrapped
+        'h=5; linear_extrude(h*2) square(1);',    # arithmetic: write `height=h*2`
+        'linear_extrude(height=2, "x.dxf", 1);',  # a string between two admitted args
+        'LINEAR_EXTRUDE(f);',                     # the old check's case-insensitivity kept
         # import and its aliases, comment-gapped and plain.
         'import("x.stl");',
         'import/**/("x.stl");',                   # comment between name and (
@@ -71,6 +84,13 @@ def test_mh256_bypass_is_refused(source):
     )
 
 
+def test_extrude_refusal_names_the_position_not_the_path():
+    with pytest.raises(ScadRefused) as exc:
+        assert_no_external_reference('linear_extrude(height=1, "/etc/some_secret_path.dxf");')
+    assert "argument 2" in exc.value.detail
+    assert "/etc/some_secret_path" not in str(exc.value)
+
+
 def test_refusal_message_never_echoes_the_model_path():
     """The refusal names the construct, never the model-chosen path."""
     with pytest.raises(ScadRefused) as exc:
@@ -90,7 +110,12 @@ def test_refusal_message_never_echoes_the_model_path():
         "linear_extrude(2) square(1);",                  # numeric first positional
         "linear_extrude(height=10) circle(3);",          # named argument
         "linear_extrude(height = h) circle(3);",         # named, whitespace
-        "h=5; linear_extrude(h*2) square(1);",           # arithmetic expression
+        "h=5; linear_extrude(height=h*2) square(1);",    # arithmetic, NAMED
+        "linear_extrude(-2) square(1);",                 # a signed number
+        "linear_extrude(2.5e1, center=true) square(1);", # exponent + named
+        'linear_extrude(height=2) text("linear_extrude(f)");',  # the words in a string
+        "// linear_extrude(f)\nlinear_extrude(height=2) square(1);",  # ...in a comment
+        "linear_extrude(height=h, twist=t==0 ? 0 : 90) square(1);",  # `==` inside a named
         "linear_extrude(10, twist=90) square(1);",       # numeric + named
         "rotate_extrude() translate([10,0]) circle(2);", # empty args
         "rotate_extrude(angle=270) translate([5,0]) circle(1);",
