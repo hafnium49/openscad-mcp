@@ -42,14 +42,67 @@ import os
 import re
 from pathlib import Path
 
-#: The file-referencing constructs, refused as a FEATURE. Word-boundaried (leading
-#: ``[^A-Za-z0-9_]`` and the trailing ``\s*[<(]``) so ``included_parts`` or
-#: ``surface_area(`` are not caught — a guard that fires on ordinary code is one that
-#: gets bypassed. ``\s`` spans newlines, matching OpenSCAD's own lexer, which accepts
-#: ``include`` and ``<`` separated by whitespace. Ported from v6's ``_FILE_REFERENCING``.
-_FILE_REFERENCING = re.compile(
-    r"(?:^|[^A-Za-z0-9_])(include|use|import|surface)\s*[<(]", re.IGNORECASE
+#: ``include <...>`` / ``use <...>`` — the ``<...>``-syntax file references. Word-
+#: boundaried (leading ``[^A-Za-z0-9_]``) so ``included_parts`` is not caught. Only
+#: literal whitespace is allowed between the keyword and ``<``: OpenSCAD 2021.01's
+#: include lexer treats a ``/*comment*/`` there as a PARSE ERROR, not whitespace, so
+#: ``include/**/<x>`` reads nothing and is deliberately NOT matched (pinned by test).
+#: ``\s`` spans newlines, matching the lexer, which accepts a real newline there.
+_INCLUDE_USE = re.compile(
+    r"(?:^|[^A-Za-z0-9_])(include|use)\s*<", re.IGNORECASE
 )
+
+#: Comments are whitespace to OpenSCAD's expression lexer, so ``import/**/("x")`` and
+#: ``surface/**/(file=...)`` are real file reads. A check that skipped comments would
+#: be one comment away from not running. Mirrors v6 ``scad_compute._GAP``. Used only
+#: for the CALL forms below (``name(...)``), never for the ``<...>`` include/use rule.
+_GAP = r"(?:\s|/\*[\s\S]*?\*/|//[^\n]*(?:\n|$))*"
+
+#: The call-syntax file-reading builtins, refused as a FEATURE. ``import`` and its
+#: ``import_stl``/``import_off``/``import_dxf`` aliases, ``surface``, and every
+#: deprecated ``dxf_*`` reader (``dxf_linear_extrude``/``dxf_rotate_extrude``/
+#: ``dxf_dim``/``dxf_cross``). The leading ``(?<![A-Za-z0-9_$.])`` keeps
+#: ``my_surface_area(`` / ``do_import(`` out. The trailing ``_GAP\(`` tolerates a
+#: comment or newline before the paren, matching the lexer.
+_FILE_CALL = re.compile(
+    r"(?<![A-Za-z0-9_$.])"
+    r"(import_stl|import_off|import_dxf|import"
+    r"|surface"
+    r"|dxf_linear_extrude|dxf_rotate_extrude|dxf_dim|dxf_cross)"
+    + _GAP + r"\(",
+    re.IGNORECASE,
+)
+
+#: A ``file =`` named argument anywhere — the shared file route of ``surface``,
+#: ``import``, the ``dxf_*`` family and ``linear_extrude``/``rotate_extrude``. The
+#: lookbehind keeps ``myfile``/``file_name`` out; ``(?!=)`` keeps the ``==``
+#: comparison out. ``file`` as a plain variable is vanishingly rare and refusing it
+#: is safe, so this is not narrowed further.
+_FILE_KWARG = re.compile(
+    r"(?<![A-Za-z0-9_$.])file" + _GAP + r"=(?!=)", re.IGNORECASE
+)
+
+#: ``linear_extrude``/``rotate_extrude`` keep a deprecated ``file`` parameter, and
+#: OpenSCAD 2021.01 binds POSITIONAL arguments to it BY INDEX regardless of any named
+#: argument written before them, then reads the file for ANY string-valued expression.
+#: MH-256 first looked only at the first token after ``(``, and a peer review showed
+#: ``linear_extrude(height=1, "x.dxf")``, ``linear_extrude(str("x", ".dxf"))`` and
+#: ``f=["x.dxf"]; linear_extrude(f[0])`` all READ the file (measured on the host's
+#: 2021.01, 2026-10-14). Whether an expression is a string is a runtime fact, so the
+#: rule is positive and lexical, the same as v6 ``scad_compute.file_read_violations``:
+#: split the call at TOP-LEVEL commas (bracket-, string- and comment-aware) and admit
+#: each argument only if it is NAMED (``height=``, ``$fn=``), a bare number, or a
+#: signed number. Anything else positional is refused — ``linear_extrude(h*2)``
+#: included; the skill tells the model to write ``height=``.
+_EXTRUDE_CALLS = frozenset({"linear_extrude", "rotate_extrude"})
+_TOKEN = re.compile(
+    r"(?P<ws>\s+)|(?P<lc>//[^\n]*)|(?P<bc>/\*[\s\S]*?(?:\*/|\Z))"
+    r'|(?P<str>"(?:[^"\\]|\\[\s\S])*(?:"|\Z))'
+    r"|(?P<num>(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?(?![A-Za-z0-9_]))"
+    r"|(?P<id>\$?[A-Za-z0-9_]+)"
+    r"|(?P<op>==|!=|<=|>=|&&|\|\||[\s\S])"
+)
+
 
 #: The ONE library reference a caller may write, matched as a WHOLE LINE, mirroring
 #: v6's ``_MCAD_LINE``. ``bitmap/`` is the one sub-directory admitted (as on the host);
@@ -141,30 +194,200 @@ def _strip_allowed_mcad_lines(source: str) -> str:
     return "\n".join(lines)
 
 
+def _reason(code: str, detail: str) -> "ScadRefused":
+    return ScadRefused(code, detail)
+
+
+_EXTERNAL_REFERENCE_DETAIL = (
+    "This daemon renders self-contained programs only: include/use/import/surface, "
+    "the dxf_* readers, a `file=` argument and any positional argument of "
+    "linear_extrude/rotate_extrude other than a plain number are refused as a FEATURE, "
+    "because validating a model-chosen path is not a property anyone can check. "
+    "Installed MCAD files may be referenced as a whole-line `include <MCAD/<file>.scad>`."
+)
+
+
 def assert_no_external_reference(source: str) -> None:
     """Refuse the whole file-referencing feature, except an installed MCAD whole line.
 
     ⚠️ POSITIVE PROPERTY, NOT A PATH DENYLIST. The claim this makes is "this program
     references no external file", which is checkable; "this path is safe" is not.
 
-    ⚠️ RESIDUAL, STATED, matching v6's identical scope: the DEPRECATED file-reading
-    forms ``linear_extrude(file=...)`` / ``rotate_extrude(file=...)`` and the
-    ``dxf_dim``/``dxf_cross`` functions are not matched here, because blanket-refusing
-    ``linear_extrude`` would refuse the single most common OpenSCAD idiom. They reach
-    only the deprecated DXF-file path, the model never emits them, and they are
-    further bounded by the empty working directory + cleared ``OPENSCADPATH``.
+    MH-256 widened the lexical scope to close the holes MH-254 left open: the lexer
+    is now comment/whitespace-aware between a builtin name and its ``(``; it refuses
+    ``import``/``import_stl``/``import_off``/``import_dxf``, ``surface``, every
+    ``dxf_*`` reader, any ``file =`` named argument, and (2026-10-14, after a peer
+    review) every positional argument of ``linear_extrude``/``rotate_extrude`` that is
+    not a plain number — the earlier first-token check admitted a later positional.
+
+    ⚠️ This lexical refusal is DEFENSE IN DEPTH. The load-bearing control is the
+    mount-namespace sandbox in :mod:`openscad_mcp.sandbox`, which makes every host
+    file ABSENT — so a form that slips this lexer still cannot read anything.
     """
     scan = _strip_allowed_mcad_lines(source)
-    m = _FILE_REFERENCING.search(scan)
+
+    m = _INCLUDE_USE.search(scan)
     if m:
-        raise ScadRefused(
+        raise _reason(
             "external_reference_refused",
-            f"the source uses {m.group(0).strip()!r}. This daemon renders "
-            f"self-contained programs only: include/use/import/surface and font "
-            f"files are refused as a FEATURE, because validating a model-chosen path "
-            f"is not a property anyone can check. Installed MCAD files may be "
-            f"referenced as a whole-line `include <MCAD/<file>.scad>`.",
+            f"the source uses {m.group(1).lower()!r} with a `<...>` reference. "
+            + _EXTERNAL_REFERENCE_DETAIL,
         )
+
+    m = _FILE_CALL.search(scan)
+    if m:
+        raise _reason(
+            "external_reference_refused",
+            f"the source calls {m.group(1).lower()!r}. " + _EXTERNAL_REFERENCE_DETAIL,
+        )
+
+    m = _FILE_KWARG.search(scan)
+    if m:
+        raise _reason(
+            "external_reference_refused",
+            "the source passes a `file=` argument. " + _EXTERNAL_REFERENCE_DETAIL,
+        )
+
+    _assert_extrude_positionals(scan)
+
+
+def _tokens(text: str) -> list[tuple[str, str]]:
+    """``[(kind, text)]`` with whitespace and comments dropped. Kinds: str, num, id, op."""
+    out: list[tuple[str, str]] = []
+    for m in _TOKEN.finditer(text):
+        kind = m.lastgroup or "op"
+        if kind not in ("ws", "lc", "bc"):
+            out.append((kind, m.group()))
+    return out
+
+
+def _assert_extrude_positionals(scan: str) -> None:
+    """Refuse every positional argument of ``linear_extrude``/``rotate_extrude`` that is
+    not a (signed) number literal — any one of them can bind the deprecated ``file``
+    parameter (see ``_EXTRUDE_CALLS``). An index walk, never a slice per call (v6
+    measured the slice at O(calls x tokens): 6 s on a 1 MiB program)."""
+    toks = _tokens(scan)
+    for i, (kind, val) in enumerate(toks):
+        if kind != "id" or val.lower() not in _EXTRUDE_CALLS:
+            continue
+        if i + 1 >= len(toks) or toks[i + 1][1] != "(":
+            continue
+        depth = 0
+        args: list[list[tuple[str, str]]] = []
+        cur: list[tuple[str, str]] = []
+        for j in range(i + 2, len(toks)):
+            k2, v2 = toks[j]
+            if k2 == "op" and v2 in "([{":
+                depth += 1
+            elif k2 == "op" and v2 in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif k2 == "op" and v2 == "," and depth == 0:
+                args.append(cur)
+                cur = []
+                continue
+            cur.append((k2, v2))
+        args.append(cur)
+        for pos, arg in enumerate(args, start=1):
+            if not arg or (len(arg) >= 2 and arg[0][0] == "id" and arg[1][1] == "="):
+                continue  # empty, or NAMED (`==` is one token, so a comparison is not)
+            if len(arg) == 1 and arg[0][0] == "num":
+                continue  # a bare number
+            if len(arg) == 2 and arg[0][1] in ("-", "+") and arg[1][0] == "num":
+                continue  # a signed number
+            # The argument's POSITION, never its text: a refusal does not echo a
+            # model-chosen path (pinned by test_refusal_message_never_echoes_the_model_path).
+            fn = val.lower()
+            raise _reason(
+                "external_reference_refused",
+                f"{fn}() binds a positional argument to its deprecated `file` parameter, "
+                f"so argument {pos} (not a plain number) could name a file to read. Name it: "
+                f"{fn}(height=...) / {fn}(angle=...), or pass a plain number. "
+                + _EXTERNAL_REFERENCE_DETAIL,
+            )
+
+
+# ============================================================================
+# Output filter (MH-256 layer 3): nothing derived from a file the caller did
+# not write may reach the model.
+# ============================================================================
+
+#: An absolute path token, as it appears in OpenSCAD diagnostics — bare, quoted, or
+#: back-ticked (``WARNING: ... in `/path/file'``). Stops at whitespace and the quote
+#: characters OpenSCAD wraps paths in.
+_ABS_PATH = re.compile(r"/[^\s'\"`<>(){}]+")
+
+#: Quoted spans OpenSCAD echoes: single, double and back-tick. The content of a span
+#: that is not present verbatim in the caller's own source is redacted, because it can
+#: only have come from a file (an ``Illegal ID '<first line of a DXF>'`` leak, a
+#: back-ticked path, an SVG parser echoing a raw line).
+_QUOTED = re.compile(r"'([^'\n]*)'|\"([^\"\n]*)\"|`([^`\n]*)`")
+
+_REDACTED = "[redacted]"
+
+
+def _names_foreign_path(line: str, job_prefix: str) -> bool:
+    """True if ``line`` names any absolute path that is not inside the job dir."""
+    for m in _ABS_PATH.finditer(line):
+        token = m.group(0).rstrip(".,:;'\"`)")
+        try:
+            resolved = os.path.normpath(token)
+        except ValueError:
+            return True
+        if resolved == job_prefix or resolved.startswith(job_prefix + os.sep):
+            continue
+        return True
+    return False
+
+
+def _redact_foreign_quotes(line: str, source: str) -> str:
+    """Replace the content of any quoted span absent from ``source`` with a marker."""
+
+    def repl(m: "re.Match[str]") -> str:
+        for gi, quote in ((1, "'"), (2, '"'), (3, "`")):
+            inner = m.group(gi)
+            if inner is None:
+                continue
+            if inner == "" or inner in source:
+                return m.group(0)
+            return f"{quote}{_REDACTED}{quote}"
+        return m.group(0)
+
+    return _QUOTED.sub(repl, line)
+
+
+def redact_external_output(text: str, *, job_dir, source: str) -> str:
+    """Strip anything derived from a file the caller did not write (MH-256 layer 3).
+
+    OpenSCAD's own error channel is a read-and-report primitive: a DXF reader prints
+    ``Illegal ID '<first line of the file>'`` and the SVG importer echoes raw lines,
+    all of which reach the model through the ``OpenSCAD ... failed: {stderr}`` raise
+    and through ``validate_scad``'s parsed warnings. Two passes, line by line:
+
+    1. DROP any line that names an absolute path outside ``job_dir`` — the
+       ``in `/etc/...'`` / ``Can't open '/home/...'`` shape, which both carries a host
+       path and tends to carry a fragment of the file beside it.
+    2. In the lines that remain, REDACT the content of any quoted span that does not
+       occur verbatim in the caller's ``source`` — so a leaked ``'SECRET=...'`` is
+       blanked while the caller's own echoed strings and variable names survive.
+
+    This is the last net, behind the sandbox (the file is unreadable) and the guard
+    (the reference is refused); it exists so a path that reaches OpenSCAD's stderr by
+    some route we did not foresee still cannot copy file content back to the model.
+    """
+    if not text:
+        return text
+    try:
+        job_prefix = os.path.normpath(str(Path(job_dir).resolve()))
+    except (OSError, ValueError):
+        job_prefix = os.path.normpath(str(job_dir))
+    kept: list[str] = []
+    for line in text.split("\n"):
+        if _names_foreign_path(line, job_prefix):
+            continue
+        kept.append(_redact_foreign_quotes(line, source))
+    return "\n".join(kept)
 
 
 #: 🔴 THE RENDERER'S ENVIRONMENT IS AN ALLOW-LIST, NOT ``os.environ`` MINUS A FEW.
@@ -202,4 +425,5 @@ __all__ = [
     "assert_no_external_reference",
     "available_mcad_files",
     "child_environment",
+    "redact_external_output",
 ]

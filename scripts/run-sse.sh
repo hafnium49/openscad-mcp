@@ -27,6 +27,19 @@ if ! pgrep -af 'Xvfb :99' >/dev/null; then
 fi
 export DISPLAY=:99
 
+# --- Render sandbox pre-flight (MH-256) ----------------------------------
+# Every openscad child process is confined with bubblewrap (see
+# src/openscad_mcp/sandbox.py). bwrap is a HARD dependency: without it, the
+# daemon starts but every render/export/validate/analyze FAILS CLOSED with
+# "the render sandbox (bubblewrap) could not be established". Install with
+# `sudo apt-get install -y bubblewrap` and ensure unprivileged user
+# namespaces are enabled (Ubuntu 22.04 default). This echo is advisory; the
+# fail-closed behaviour is enforced in code, not here.
+if ! command -v bwrap >/dev/null 2>&1; then
+    echo "WARNING: bwrap (bubblewrap) not found on PATH — every render will be" \
+         "REFUSED (fail-closed MH-256). Install: sudo apt-get install -y bubblewrap" >&2
+fi
+
 # --- Daemon environment --------------------------------------------------
 # Resolve OpenSCAD binary at script start so the daemon doesn't have to
 # re-probe per-render. Falls back to the canonical apt install path.

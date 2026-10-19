@@ -430,15 +430,15 @@ class TestValidateScad:
         assert result["success"] is False
         assert "allowed paths" in result["error"].lower() or "not within" in result["error"].lower()
 
-    async def test_discard_output_is_real_png_under_cache_dir(
+    async def test_discard_output_is_real_png_inside_job_dir(
         self, configured_env, mock_subprocess_success
     ):
         """The validate command must NOT use ``-o /dev/null`` — OpenSCAD
         2021.01 rejects ``/dev/null`` before parsing because the suffix
         doesn't determine an export format (this was bug B1, fixed
-        2026-05-07). Output target is now a real ``.png`` discard file
-        under ``config.cache.directory`` so ``MCP_CACHE_SIZE_MB`` covers
-        it."""
+        2026-05-07). MH-256: the discard ``.png`` now lives INSIDE the
+        per-job work dir (the sandbox's only writable path) and is removed
+        with it, rather than under the cache dir."""
         captured_cmds = []
 
         def capturing_mock(cmd, **kwargs):
@@ -455,6 +455,8 @@ class TestValidateScad:
         ):
             await validate_scad_fn(scad_content="cube(10);")
 
+        # One openscad invocation (the sandbox self-test is stubbed in
+        # configured_env), captured as a bwrap-wrapped argv.
         assert len(captured_cmds) == 1
         cmd = captured_cmds[0]
         assert "-o" in cmd
@@ -465,10 +467,8 @@ class TestValidateScad:
             f"validate_scad must NOT use {output_target!r} as -o target; "
             f"OpenSCAD 2021.01 rejects /dev/null before parsing (bug B1)"
         )
-        # Discard file must end with .png and carry the validate_discard_
-        # prefix (so it's auditable in the cache dir).
         assert output_target.endswith(".png"), output_target
-        assert "validate_discard_" in output_target, output_target
+        assert output_target.endswith("validate_discard.png"), output_target
 
     async def test_hardwarnings_flag(self, configured_env, mock_subprocess_success):
         """The validate command should include --hardwarnings flag."""

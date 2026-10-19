@@ -37,8 +37,8 @@ from .utils.config import get_config
 from .scad_guard import (
     ScadRefused,
     assert_no_external_reference,
-    child_environment,
 )
+from .sandbox import run_openscad
 
 
 def _guarded_source_text(
@@ -500,14 +500,15 @@ def render_scad_to_png(
         # Add the SCAD file
         cmd.append(str(scad_path))
 
-        # Run OpenSCAD in the isolated working dir with a minimal allow-listed
-        # environment (MH-254), so no token/key/AWS_* value from the daemon's
-        # environment is visible to the program the model wrote.
+        # Run OpenSCAD inside the MH-256 mount-namespace sandbox (fail-closed): the
+        # program the model wrote can read only what OpenSCAD needs and write only
+        # this per-render dir, and its stderr is filtered before it reaches us.
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, check=False,
+            result = run_openscad(
+                cmd,
+                work=temp_path,
+                source=source_text,
                 timeout=config.rendering.timeout_seconds,
-                cwd=temp_dir, env=child_environment(temp_path),
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError(
@@ -1517,8 +1518,13 @@ async def export_model(
         scad_input_path = work_dir / "input.scad"
         scad_input_path.write_text(source_text)
 
+        # OpenSCAD writes INSIDE the sandbox's only writable dir (work_dir); the
+        # result is moved to final_output afterwards (MH-256), so the sandbox needs
+        # no bind beyond work_dir and final_output may be anywhere the daemon can write.
+        sandbox_output = work_dir / f"output.{fmt}"
+
         # Build command
-        cmd = [openscad_cmd, "-o", str(final_output)]
+        cmd = [openscad_cmd, "-o", str(sandbox_output)]
 
         # Add variables
         if variables:
@@ -1541,20 +1547,15 @@ async def export_model(
         if ctx:
             await ctx.info(f"Exporting to {fmt}...")
 
-        # Run OpenSCAD in executor, in the isolated working dir with a minimal
-        # allow-listed environment (MH-254).
+        # Run OpenSCAD in executor, inside the MH-256 sandbox (fail-closed).
         def _run_export():
             try:
-                result = subprocess.run(
+                return run_openscad(
                     cmd,
-                    capture_output=True,
-                    text=True,
-                    check=False,
+                    work=work_dir,
+                    source=source_text,
                     timeout=config.rendering.timeout_seconds,
-                    cwd=str(work_dir),
-                    env=child_environment(work_dir),
                 )
-                return result
             except subprocess.TimeoutExpired:
                 raise RuntimeError(
                     f"OpenSCAD export timed out after "
@@ -1565,12 +1566,18 @@ async def export_model(
             result = await asyncio.get_running_loop().run_in_executor(
                 None, _run_export
             )
-        finally:
-            # Remove the isolated input dir on every exit path.
-            shutil.rmtree(work_dir, ignore_errors=True)
 
-        if result.returncode != 0:
-            raise RuntimeError(f"OpenSCAD export failed: {result.stderr}")
+            if result.returncode != 0:
+                raise RuntimeError(f"OpenSCAD export failed: {result.stderr}")
+
+            if not sandbox_output.exists():
+                raise RuntimeError("OpenSCAD did not produce output file")
+
+            # Move the artifact out of the sandbox dir to its final location.
+            shutil.move(str(sandbox_output), str(final_output))
+        finally:
+            # Remove the isolated work dir on every exit path.
+            shutil.rmtree(work_dir, ignore_errors=True)
 
         if not final_output.exists():
             raise RuntimeError("OpenSCAD did not produce output file")
@@ -2145,19 +2152,10 @@ async def validate_scad(
         #
         # Use a real .png discard target instead. OpenSCAD still emits
         # ECHO/WARNING/ERROR to stderr while parsing, which is what
-        # `_parse_openscad_stderr` consumes. The PNG itself is unlinked
-        # in the `finally` clause below (covers the timeout path too).
-        #
-        # Discard PNG goes under config.cache.directory (NOT
-        # config.temp_dir) so MCP_CACHE_SIZE_MB's
-        # `_evict_cache_if_needed` covers it — `temp_dir` has no cap
-        # today (Security review F4, 2026-05-07).
-        cache_dir = Path(config.cache.directory)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        discard_output = (
-            cache_dir
-            / f"validate_discard_{uuid.uuid4().hex[:16]}.png"
-        )
+        # `_parse_openscad_stderr` consumes. MH-256: the discard PNG goes
+        # INSIDE work_dir (the sandbox's only writable path) and is removed
+        # with the whole work_dir in the `finally` clause.
+        discard_output = work_dir / "validate_discard.png"
         cmd = [
             openscad_cmd,
             "--hardwarnings",
@@ -2185,20 +2183,15 @@ async def validate_scad(
         if ctx:
             await ctx.info("Validating OpenSCAD code...")
 
-        # Run OpenSCAD in executor, in the isolated working dir with a minimal
-        # allow-listed environment (MH-254).
+        # Run OpenSCAD in executor, inside the MH-256 sandbox (fail-closed).
         def _run_validate():
             try:
-                result = subprocess.run(
+                return run_openscad(
                     cmd,
-                    capture_output=True,
-                    text=True,
-                    check=False,
+                    work=work_dir,
+                    source=source_text,
                     timeout=config.rendering.timeout_seconds,
-                    cwd=str(work_dir),
-                    env=child_environment(work_dir),
                 )
-                return result
             except subprocess.TimeoutExpired:
                 raise RuntimeError(
                     f"OpenSCAD validation timed out after "
@@ -2215,7 +2208,7 @@ async def validate_scad(
                 None, _run_validate
             )
 
-            # Parse stderr for messages
+            # Parse stderr for messages (already output-filtered by the runner).
             parsed = _parse_openscad_stderr(result.stderr)
 
             is_valid = (
@@ -2239,9 +2232,8 @@ async def validate_scad(
                 "deprecated": parsed["deprecated"],
             }
         finally:
+            # work_dir holds the discard PNG and the input; remove it whole.
             shutil.rmtree(work_dir, ignore_errors=True)
-            if discard_output.exists():
-                discard_output.unlink()
 
     except Exception as e:
         if ctx:
@@ -2341,11 +2333,9 @@ async def analyze_model(
         scad_input_path = work_dir / "input.scad"
         scad_input_path.write_text(source_text)
 
-        # Create temp STL output path
-        stl_output = (
-            temp_dir_path
-            / f"analyze_{uuid.uuid4().hex[:8]}.stl"
-        )
+        # STL output goes INSIDE work_dir (the sandbox's only writable path) and is
+        # parsed in place, then removed with the whole work_dir (MH-256).
+        stl_output = work_dir / "analyze.stl"
 
         # Build export command
         cmd = [openscad_cmd, "-o", str(stl_output)]
@@ -2371,20 +2361,15 @@ async def analyze_model(
         if ctx:
             await ctx.info("Analyzing model geometry...")
 
-        # Run OpenSCAD export in executor, in the isolated working dir with a
-        # minimal allow-listed environment (MH-254).
+        # Run OpenSCAD export in executor, inside the MH-256 sandbox (fail-closed).
         def _run_export():
             try:
-                result = subprocess.run(
+                return run_openscad(
                     cmd,
-                    capture_output=True,
-                    text=True,
-                    check=False,
+                    work=work_dir,
+                    source=source_text,
                     timeout=config.rendering.timeout_seconds,
-                    cwd=str(work_dir),
-                    env=child_environment(work_dir),
                 )
-                return result
             except subprocess.TimeoutExpired:
                 raise RuntimeError(
                     f"OpenSCAD export timed out after "
@@ -2395,30 +2380,22 @@ async def analyze_model(
             result = await asyncio.get_running_loop().run_in_executor(
                 None, _run_export
             )
-        finally:
-            # Remove the isolated input dir on every exit path.
-            shutil.rmtree(work_dir, ignore_errors=True)
 
-        if result.returncode != 0:
-            # Clean up STL if it exists
-            if stl_output.exists():
-                stl_output.unlink()
-            raise RuntimeError(
-                f"OpenSCAD export failed: {result.stderr}"
-            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"OpenSCAD export failed: {result.stderr}"
+                )
 
-        if not stl_output.exists():
-            raise RuntimeError(
-                "OpenSCAD did not produce STL output file"
-            )
+            if not stl_output.exists():
+                raise RuntimeError(
+                    "OpenSCAD did not produce STL output file"
+                )
 
-        # Parse STL vertices
-        try:
+            # Parse STL vertices (the STL is inside work_dir, removed below).
             vertices = _parse_stl_vertices(stl_output)
         finally:
-            # Always clean up temp STL
-            if stl_output.exists():
-                stl_output.unlink()
+            # Remove the isolated work dir (input + STL) on every exit path.
+            shutil.rmtree(work_dir, ignore_errors=True)
 
         if not vertices:
             raise ValueError(

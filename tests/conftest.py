@@ -364,6 +364,17 @@ def reset_environment(monkeypatch):
     # Reset the global config singleton so tests don't get stale cached config
     set_config(None)
 
+    # MH-256: sandbox_available() self-tests bwrap via subprocess.run and caches the
+    # result. Several unit tests patch the global subprocess.run to fake OpenSCAD,
+    # which would also intercept that self-test and poison the cache for later tests.
+    # Clear it between tests so each starts from a clean probe (the mock-based tests
+    # additionally stub sandbox_available itself — see configured_env).
+    try:
+        from openscad_mcp.sandbox import sandbox_available
+        sandbox_available.cache_clear()
+    except Exception:
+        pass
+
     # Ensure clean temp directory
     import tempfile
     import shutil
@@ -423,6 +434,11 @@ def configured_env(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "openscad_mcp.server.find_openscad", lambda: "/usr/bin/openscad"
     )
+    # MH-256: these tests fake OpenSCAD by patching the global subprocess.run; the
+    # real confinement is exercised by the dedicated sandbox tests (real binary +
+    # canary), so here we stub the sandbox self-test to True and let the wrapped
+    # command still flow through the mocked subprocess.run.
+    monkeypatch.setattr("openscad_mcp.sandbox.sandbox_available", lambda: True)
     return tmp_path, cfg
 
 
@@ -449,6 +465,8 @@ def configured_env_with_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "openscad_mcp.server.find_openscad", lambda: "/usr/bin/openscad"
     )
+    # MH-256: see configured_env — stub the sandbox self-test for the mocked path.
+    monkeypatch.setattr("openscad_mcp.sandbox.sandbox_available", lambda: True)
     return tmp_path, cfg, cache_dir
 
 
